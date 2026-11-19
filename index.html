@@ -4867,7 +4867,124 @@ const FBT={mode:'fb',uid:null,code:null,fb:null,db:null,subs:[],hsubs:[],msubs:[
   detachMafia(){this.off(this.msubs);},
   sendAct(a){const p=this.r('inbox').push({uid:this.uid,a:clean(a),ts:this.TS()});if(p&&p.catch)p.catch(()=>{});}
 };
-let T=FB_ON?FBT:DT;
+
+/* ===================== 통신 계층 ③: PeerJS (기기끼리 직접 연결, 서버 설정 불필요) =====================
+   방장 기기가 곧 서버: 방장 Peer ID = 'hallaemallae-maf-v1-' + 방 코드.
+   참가자 → 방장: join / act / leave,  방장 → 참가자: host / view / chat / closed.
+   마피아 채팅·사망자 채팅은 방장이 해당 참가자에게만 보냄 (남의 제시어·직업은 각자 view 에만 들어 있음).
+   방장이 나가거나 연결이 끊기면 방이 끝남(방장 위임 없음). 참가자는 끊겨도 같은 코드로 다시 들어오면 자리를 이어받음. */
+const PJPRE='hallaemallae-maf-v1-';
+const PJT={mode:'p2p',uid:null,code:null,peer:null,h:null,c:null,conns:{},lastViews:{},mafia:{},dead:{},hostConn:null,
+  mcb:null,dcb:null,mbuf:[],dbuf:[],pendingHost:[],closing:false,retry:0,retryT:null,name:'',hostUid:null,
+  _o:null,opts(){if(this._o)return Object.assign({},this._o);const o={debug:0};try{const q=new URLSearchParams(location.search);if(q.get('peerhost')){o.host=q.get('peerhost');o.port=+(q.get('peerport')||9000);o.path=q.get('peerpath')||'/';o.secure=q.get('peersecure')==='1';}}catch(e){}this._o=o;return Object.assign({},o);},
+  async init(){
+    if(!window.Peer){try{await loadScript('https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js');}catch(e){}}
+    if(!window.Peer)throw new Error('온라인 모듈을 불러오지 못했어요');
+    let u=null;try{u=sessionStorage.getItem('lm-p2p-uid');}catch(e){}
+    if(!u){u='u_'+rid()+rid();try{sessionStorage.setItem('lm-p2p-uid',u);}catch(e){}}
+    this.opts();this.uid=u;return u;
+  },
+  kill(){clearTimeout(this.retryT);this.retryT=null;if(this.peer){const p=this.peer;this.peer=null;try{p.destroy();}catch(e){}}this.hostConn=null;},
+  /* ---------- 방장 ---------- */
+  openHostPeer(code){return new Promise((res,rej)=>{
+    const p=new Peer(PJPRE+code,this.opts());let done=false;
+    const fin=(ok,e)=>{if(done)return;done=true;clearTimeout(t);if(ok)res(p);else{try{p.destroy();}catch(_){}rej(e);}};
+    const t=setTimeout(()=>fin(false,new Error('timeout')),9000);
+    p.on('open',()=>fin(true));p.on('error',e=>fin(false,e));
+  });},
+  async createRoom(){
+    this.kill();this.closing=false;this.conns={};this.lastViews={};this.mafia={};this.dead={};this.pendingHost=[];
+    let last=null;
+    for(let k=0;k<6;k++){const code=String(Math.floor(1000+Math.random()*9000));
+      try{const p=await this.openHostPeer(code);this.peer=p;this.code=code;this.hostUid=this.uid;this.wireHost(p);try{sessionStorage.setItem('lm-p2p-host',code);}catch(e){}return code;}
+      catch(e){last=e;if(!(e&&e.type==='unavailable-id'))break;}}
+    throw new Error('방을 만들지 못했어요. 인터넷 연결을 확인하고 다시 시도하세요.'+(last&&last.type?' ('+last.type+')':''));
+  },
+  wireHost(p){
+    p.on('connection',conn=>{
+      let uid=null;
+      conn.on('data',m=>{if(!m||typeof m!=='object')return;
+        if(m.t==='join'&&m.id){uid=m.id;const old=this.conns[uid];this.conns[uid]=conn;if(old&&old!==conn)try{old.close();}catch(e){}
+          delete this.lastViews[uid];try{conn.send({t:'host',uid:this.uid});}catch(e){}
+          this.toHost('onMember',uid,{name:m.name,online:true});}
+        else if(m.t==='act'&&uid)this.toHost('onAct',uid,m.a||{});
+        else if(m.t==='leave'&&uid){if(this.conns[uid]===conn)delete this.conns[uid];this.toHost('onLeave',uid);try{conn.close();}catch(e){}}
+      });
+      const gone=()=>{if(uid&&this.conns[uid]===conn){delete this.conns[uid];delete this.lastViews[uid];if(!this.closing)this.toHost('onLeave',uid);}};
+      conn.on('close',gone);conn.on('error',gone);
+    });
+    p.on('disconnected',()=>{if(this.peer===p&&!this.closing)setTimeout(()=>{try{if(this.peer===p&&p.disconnected&&!p.destroyed)p.reconnect();}catch(e){}},1500);});
+    p.on('error',e=>console.warn('peer',e&&e.type));
+  },
+  toHost(fn,...a){if(this.h)this.h[fn](...a);else this.pendingHost.push([fn,a]);},
+  hostAttach(h){this.c=null;this.h=h;const q=this.pendingHost;this.pendingHost=[];q.forEach(([fn,a])=>h[fn](...a));},
+  hostDetach(){this.h=null;},
+  sendTo(uid,m){const c=this.conns[uid];if(c&&c.open){try{c.send(m);return true;}catch(e){}}return false;},
+  publishViews(views){for(const id in views){if(id===this.uid)continue;const str=JSON.stringify(views[id]);
+    if(str!==this.lastViews[id]&&this.sendTo(id,{t:'view',v:JSON.parse(str)}))this.lastViews[id]=str;}},
+  reject(uid,reason){this.sendTo(uid,{t:'view',v:{rejected:reason}});const c=this.conns[uid];delete this.conns[uid];setTimeout(()=>{try{c&&c.close();}catch(e){}},800);},
+  pushChat(m){const msg={t:'chat',m:clean(m)};
+    for(const id in this.conns){if(m.scope==='mafia'&&!this.mafia[id])continue;if(m.scope==='dead'&&!this.dead[id])continue;this.sendTo(id,msg);}},
+  clearChat(){},
+  setMafia(ids){this.mafia={};ids.forEach(i=>this.mafia[i]=true);},
+  setDead(ids){this.dead={};ids.forEach(i=>this.dead[i]=true);},
+  saveState(){},async loadState(){return null;},async peekMeta(){return null;},async resumeHost(){},
+  async handoff(){this.closeRoom();},async claimHost(){throw new Error('p2p');},
+  closeRoom(){this.closing=true;for(const id in this.conns)this.sendTo(id,{t:'closed'});const p=this.peer;this.peer=null;this.conns={};
+    setTimeout(()=>{try{p&&p.destroy();}catch(e){}},400);},
+  /* ---------- 참가자 ---------- */
+  connectOnce(){return new Promise((res,rej)=>{
+    const go=p=>{const conn=p.connect(PJPRE+this.code,{reliable:true});let done=false;
+      const fin=(ok,e)=>{if(done)return;done=true;clearTimeout(t);ok?res(conn):rej(e);};
+      const t=setTimeout(()=>fin(false,new Error('방장이 응답하지 않아요. 잠시 후 다시 시도하세요.')),9000);
+      conn.on('open',()=>{this.wireClient(conn);fin(true);});
+      conn.on('error',()=>fin(false,new Error('방장과 연결하지 못했어요.')));
+      p.once('error',e=>fin(false,new Error(e&&e.type==='peer-unavailable'?'방을 찾을 수 없어요. 코드를 확인하세요.':'연결하지 못했어요. 인터넷 연결을 확인하세요.')));};
+    if(this.peer&&this.peer.open&&!this.peer.destroyed)return go(this.peer);
+    this.kill();const p=this.peer=new Peer(this.opts());
+    const t0=setTimeout(()=>rej(new Error('연결 서버에 접속하지 못했어요.')),9000);
+    p.on('open',()=>{clearTimeout(t0);go(p);});
+    p.on('error',e=>{if(!p.open){clearTimeout(t0);rej(new Error('연결 서버에 접속하지 못했어요. ('+(e&&e.type)+')'));}});
+    p.on('disconnected',()=>{setTimeout(()=>{try{if(this.peer===p&&p.disconnected&&!p.destroyed)p.reconnect();}catch(e){}},1500);});
+  });},
+  async joinRoom(code,name){
+    this.code=code;this.name=name;this.closing=false;this.retry=0;this.mbuf=[];this.dbuf=[];
+    const conn=await this.connectOnce();this.hostConn=conn;conn.send({t:'join',id:this.uid,name});
+  },
+  wireClient(conn){
+    conn.on('data',m=>{if(!m||typeof m!=='object'||conn!==this.hostConn)return;
+      if(m.t==='view'&&this.c)this.c.onView(m.v);
+      else if(m.t==='host'){this.hostUid=m.uid;if(this.c)this.c.onHost(m.uid);}
+      else if(m.t==='chat'){const x=m.m||{};
+        if(x.scope==='mafia'){if(this.mcb)this.mcb(x);else this.mbuf.push(x);}
+        else if(x.scope==='dead'){if(this.dcb)this.dcb(x);else this.dbuf.push(x);}
+        else if(this.c)this.c.onChat(x);}
+      else if(m.t==='closed'){this.closing=true;const c=this.c;if(c)c.onClosed();}
+    });
+    const lost=()=>{if(conn!==this.hostConn||this.closing||!this.code)return;this.hostConn=null;this.reconnect();};
+    conn.on('close',lost);conn.on('error',lost);
+  },
+  reconnect(){
+    if(this.closing||!this.code)return;
+    if(this.retry++>=8){const c=this.c;this.closing=true;if(c)c.onClosed();return;}
+    this.retryT=setTimeout(async()=>{if(this.closing||!this.code)return;
+      try{const conn=await this.connectOnce();this.hostConn=conn;this.retry=0;conn.send({t:'join',id:this.uid,name:this.name});}
+      catch(e){this.reconnect();}},2000);
+  },
+  clientAttach(c){this.h=null;this.c=c;if(this.hostUid)c.onHost(this.hostUid);},
+  clientDetach(){this.c=null;},
+  attachMafia(cb){this.mcb=cb;const b=this.mbuf;this.mbuf=[];b.forEach(cb);},detachMafia(){this.mcb=null;},
+  attachDead(cb){this.dcb=cb;const b=this.dbuf;this.dbuf=[];b.forEach(cb);},detachDead(){this.dcb=null;},
+  sendAct(a){const c=this.hostConn;if(c&&c.open)try{c.send({t:'act',a:clean(a)});}catch(e){}},
+  leave(){
+    if(this.h){this.h=null;}
+    else if(this.hostConn&&this.hostConn.open){try{this.hostConn.send({t:'leave'});}catch(e){}}
+    this.closing=true;this.code=null;this.c=null;this.mcb=null;this.dcb=null;this.hostUid=null;
+    const p=this.peer;this.peer=null;this.hostConn=null;clearTimeout(this.retryT);
+    setTimeout(()=>{try{p&&p.destroy();}catch(e){}},300);
+  }
+};
+let T=FB_ON?FBT:(/[?&]demo\b/.test(location.search)?DT:PJT);
 
 /* ===================== 상태 ===================== */
 const ME={id:null};
@@ -5665,7 +5782,7 @@ function act(a){if(isHost)hostAct(ME.id,a);else if(roomCode)T.sendAct(a);}
 async function joinRoom(code,name){
   roomCode=code;joining=true;homeErr='';homeMsg='입장 중…';CH=[];render();
   try{await T.joinRoom(code,name);clientAttach();lset('lm-room',code);
-    setTimeout(()=>{if(joining&&!V)joinFail(T.mode==='fb'?'방장이 응답하지 않아요. 잠시 후 다시 시도하세요.':'방을 찾을 수 없어요. 코드를 확인하고, 방장 탭이 같은 브라우저에 열려 있는지 확인하세요.');},T.mode==='fb'?9000:4500);
+    setTimeout(()=>{if(joining&&!V)joinFail(T.mode!=='demo'?'방장이 응답하지 않아요. 잠시 후 다시 시도하세요.':'방을 찾을 수 없어요. 코드를 확인하고, 방장 탭이 같은 브라우저에 열려 있는지 확인하세요.');},T.mode!=='demo'?9000:4500);
   }catch(e){joinFail(e.message);}
 }
 function joinFail(msg){joining=false;T.leave();roomCode=null;V=null;homeErr=msg;homeMsg='';lset('lm-room','');render();}
@@ -5678,15 +5795,20 @@ async function leaveRoom(){
   T.leave();lset('lm-room','');
   isHost=false;G=null;V=null;roomCode=null;joining=false;homeErr='';homeMsg='';logOpen=false;CH=[];mafiaChatOn=false;deadChatOn=false;hostUidNow=null;render();
 }
-window.addEventListener('beforeunload',()=>{if(T.mode==='demo'){if(isHost&&G)T.closeRoom();else if(roomCode)T.leave();}});
+window.addEventListener('beforeunload',()=>{if(T.mode!=='fb'){if(isHost&&G)T.closeRoom();else if(roomCode)T.leave();}});
 async function boot(){
   try{['claude','gemini'].forEach(v=>localStorage.removeItem('lm-aikey-'+v));}catch(e){} // 예전에 저장한 AI 키 지우기
   const q=location.search.match(/[?&]room=(\d{4})/);if(q){codeVal=q[1];App.set('maf');}
-  homeMsg=FB_ON?'서버에 연결하는 중…':'';render();
+  homeMsg=T.mode!=='demo'?'서버에 연결하는 중…':'';render();
   try{ME.id=await T.init();}
   catch(e){T=DT;ME.id=await DT.init();homeErr='서버에 연결하지 못해 데모 모드로 실행합니다. ('+e.message+')';}
   booted=true;homeMsg=q?`초대받은 방 ${q[1]} — 닉네임을 쓰고 입장을 누르세요.`:'';render();
   const code=lget('lm-room');
+  if(code&&T.mode==='p2p'&&!q){ // 새로고침 → 참가자는 같은 방에 자동 재입장 (방장이 새로고침하면 방은 이미 끝남)
+    let wasHost=null;try{wasHost=sessionStorage.getItem('lm-p2p-host');sessionStorage.removeItem('lm-p2p-host');}catch(e){}
+    if(wasHost===code){lset('lm-room','');homeErr='방장이 페이지를 나가서 방이 끝났어요. 새 방을 만들어 주세요.';render();return;}
+    App.set('maf');joinRoom(code,nameVal.trim().slice(0,8)||'손님');return;
+  }
   if(code&&T.mode==='fb'&&!q){ // 새로고침·재접속 → 원래 방으로 복귀
     App.set('maf');
     const meta=await T.peekMeta(code);
@@ -5709,7 +5831,7 @@ function homeHTML(){
     <div class="field"><input id="code" inputmode="numeric" maxlength="4" placeholder="4자리 코드" value="${esc(codeVal)}"><button class="btn ghost" style="flex:0 0 90px" data-ui="join">입장</button></div>
     <div class="viewrow"><span>화면</span><div class="seg"><button data-ui="v3d" data-v="0" class="${use3D()?'':'on'}">2D 느와르</button><button data-ui="v3d" data-v="1" class="${use3D()?'on':''}" ${can3D()?'':'disabled'}>3D 동물 친구들${can3D()?'':' (불가)'}</button></div></div>
     <div class="err">${esc(homeErr||homeMsg)}</div>
-    <div class="demo">${T.mode==='fb'?'<b>온라인</b> · 방을 만들고 4자리 코드를 친구에게 알려 주면, 각자 폰에서 이 주소로 들어와 함께 할 수 있어요. 혼자 해 볼 때는 <b>가상 플레이어</b>를 추가하세요.':'<b>데모 모드</b> · 같은 브라우저에서 이 페이지를 탭 여러 개로 열면 각 탭이 한 사람의 폰처럼 동작해요. 혼자 해 볼 때는 방을 만든 뒤 <b>가상 플레이어</b>를 추가하세요.'}</div>
+    <div class="demo">${T.mode!=='demo'?'<b>온라인</b> · 방을 만들고 4자리 코드를 친구에게 알려 주면, 각자 폰에서 이 주소로 들어와 함께 할 수 있어요. 혼자 해 볼 때는 <b>가상 플레이어</b>를 추가하세요.'+(T.mode==='p2p'?' 방장 기기가 방을 열고 있어서, <b>방장은 화면을 켜 둔 채</b> 이 페이지에 머물러 주세요. 방장이 나가면 방이 끝나요.':'')+'':'<b>데모 모드</b> · 같은 브라우저에서 이 페이지를 탭 여러 개로 열면 각 탭이 한 사람의 폰처럼 동작해요. 혼자 해 볼 때는 방을 만든 뒤 <b>가상 플레이어</b>를 추가하세요.'}</div>
   </div>`;
 }
 function headerHTML(v){
@@ -5734,7 +5856,7 @@ let helpOpen={};
 function settingsHTML(v){
   const s=v.settings;
   const seg=(f,opts,cur)=>`<div class="seg">${opts.map(([val,lb])=>`<button data-k="set" data-f="${f}" data-v="${val}" class="${String(cur)===String(val)?'on':''}">${lb}</button>`).join('')}</div>${helpOpen[f]&&HELP[f]?`<div class="help">${HELP[f]}</div>`:''}`;
-  let h=`<div class="panel"><div class="codeBig">방 코드 <b>${v.code}</b> · ${T.mode==='fb'?'친구에게 링크를 보내 주세요':'다른 탭에서 이 코드로 입장'}${inviteBtn()}</div>`;
+  let h=`<div class="panel"><div class="codeBig">방 코드 <b>${v.code}</b> · ${T.mode!=='demo'?'친구에게 링크를 보내 주세요':'다른 탭에서 이 코드로 입장'}${inviteBtn()}</div>`;
   h+=`<div class="row"><label>게임</label>${seg('game',[['liar','라이어게임'],['mafia','마피아']],v.game)}</div>`;
   if(v.game==='liar'){
     h+=`<div class="row"><label>라이어 수<button class="hi ${helpOpen.liarCount?'on':''}" data-ui="help" data-h="liarCount" aria-label="설명">i</button></label>${seg('liarCount',[[1,'1명'],[2,'2명 (6인+)']],s.liarCount)}</div>`;

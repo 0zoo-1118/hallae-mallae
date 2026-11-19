@@ -18,4 +18,5 @@ https://<GitHub아이디>.github.io/hallae-mallae/
 ## 참고
 - 설치·빌드 없이 `index.html` 한 파일로 동작합니다.
 - 외부 라이브러리: three.js (r128), PeerJS 1.5.5 — CDN으로 불러옵니다.
-- **마피아·라이어**는 기기 간 온라인 플레이를 하려면 `index.html` 안의 `FIREBASE_CONFIG`에 Firebase(Realtime Database) 설정을 넣어야 합니다. 비어 있으면 같은 브라우저 탭끼리만 되는 데모 모드로 동작합니다.
+- 모든 게임이 PeerJS(기기끼리 직접 연결)로 동작해서 서버 설정이 필요 없습니다. 방장 기기가 방을 열고 있으므로, 방장은 화면을 켜 둔 채 페이지에 머물러야 합니다 (방장이 나가면 방이 끝남).
+- 마피아·라이어: 참가자는 연결이 끊기거나 새로고침해도 같은 방에 자동으로 다시 들어갑니다. `index.html` 안의 `FIREBASE_CONFIG`를 채우면 Firebase 방식(방장 위임 지원)으로 바뀝니다.
